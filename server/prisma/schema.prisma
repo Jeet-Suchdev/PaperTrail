@@ -1,0 +1,10 @@
+// Slice 0: datasource + generator only. Tables arrive with the slices that
+// need them, via Prisma migrations (no models yet, so nothing to migrate).
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
