@@ -1,0 +1,105 @@
+# PaperTrail
+
+**Practice investing in Indian markets without risking real money.**
+
+PaperTrail is a full-stack paper-trading web app for NSE/BSE stocks. Start with virtual cash, trade at real (delayed) market prices, track your portfolio live, and get AI-powered explanations of how you're doing and why. No real orders, no brokers, no real money.
+
+> **Status:** 🚧 In active development. See the [roadmap](#roadmap) for what's built so far.
+
+<!-- Add a screenshot or short GIF of the dashboard here once Slice 4 is done -->
+
+## Features
+
+- **Virtual portfolio:** every account starts with ₹10,00,000 of virtual cash
+- **Real market prices:** NSE/BSE quotes via a backend price service with caching and a simulated fallback
+- **Live updates:** prices and portfolio value stream to the browser over WebSockets
+- **Market and limit orders:** limit orders fill automatically when the price crosses your limit
+- **Portfolio analytics:** holdings, unrealized and realized P&L, day change, allocation, history charts
+- **Watchlist:** track stocks you haven't bought yet
+- **AI insights:** plain-language portfolio summaries, trade reviews that spot patterns in your behaviour, and a chat assistant that answers questions about your own holdings
+
+> PaperTrail is an educational tool. AI output is based on virtual trades and is **not investment advice**.
+
+## Tech stack
+
+| Area | Tools |
+|---|---|
+| Frontend | React, Vite, TypeScript, Tailwind CSS, TanStack Query |
+| Backend | Node.js, Express, TypeScript, Zod |
+| Realtime | Socket.IO |
+| Database | PostgreSQL, Prisma |
+| Market data | `yahoo-finance2` behind a provider interface, plus a simulated provider |
+| AI | LLM behind a swappable client interface |
+| Testing | Vitest, Supertest |
+
+## Engineering highlights
+
+- **Money is handled as integer paise**, never floating point.
+- **Every trade runs in a single database transaction** with wallet row locking, so concurrent orders can't overspend.
+- **Append-only ledger:** wallet balance always equals the sum of ledger entries, and this invariant is tested.
+- **One price poller serves all users:** the backend polls, caches, and fans out via WebSockets. The frontend never calls the market API.
+- **Graceful degradation:** if the market data provider fails, the app falls back to simulated prices and says so in the UI.
+- **The LLM never does the math:** the backend computes every number, and the model only narrates. Chat answers come from tool calls into existing services.
+
+## Roadmap
+
+- [x] Foundation (monorepo, Postgres, Prisma, tooling)
+- [ ] Auth and wallet
+- [ ] Market data service
+- [ ] Trading core (market orders, holdings, P&L)
+- [ ] Realtime dashboard
+- [ ] Charts, history, watchlist
+- [ ] Limit orders
+- [ ] AI features
+- [ ] Polish, seed data, deployment
+
+## Getting started
+
+### Prerequisites
+
+- Node.js 22.12+ (this project is developed on Node 25)
+- [pnpm](https://pnpm.io) 12: `npm install -g pnpm`
+- Docker Desktop (PostgreSQL runs in a container)
+
+### Setup
+
+```bash
+pnpm install                           # install workspace dependencies
+docker compose up -d                   # start PostgreSQL (papertrail + papertrail_test)
+cp server/.env.example server/.env     # create your local environment file
+pnpm dev                               # run server (:3001) and client (:5173)
+```
+
+Open http://localhost:5173 — the home page calls `GET /api/health`, which
+runs `SELECT 1` against PostgreSQL, so a green "OK" badge means your whole
+stack (client → server → database) is wired up.
+
+Notes:
+
+- `pnpm dev` runs `prisma generate` for you. There are **no database
+  migrations yet** — tables arrive with later slices (see the
+  [roadmap](#roadmap)).
+- Integration tests run against the separate `papertrail_test` database
+  (`DATABASE_URL_TEST`), so `pnpm test` never touches your dev data.
+
+### Useful commands
+
+```bash
+pnpm test           # run all tests
+pnpm typecheck      # TypeScript, both packages
+pnpm lint           # ESLint
+pnpm format:check   # Prettier
+```
+
+## Project docs
+
+- [`SPEC.md`](./SPEC.md): product and technical specification
+- [`AGENTS.md`](./AGENTS.md): conventions for AI coding agents working in this repo
+
+## Disclaimer
+
+PaperTrail is a simulation for learning. It does not execute real trades, does not connect to any broker, and does not provide financial advice. Market data may be delayed or inaccurate.
+
+## License
+
+TBD (MIT is a common choice for portfolio projects)
