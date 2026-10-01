@@ -1,0 +1,23 @@
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+
+# Environment files — .env stays local; .env.example is committed (see negation below)
+.env
+.env.*
+!.env.example
+
+# Generated Prisma client (regenerate with: pnpm --filter server exec prisma generate)
+server/src/generated/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

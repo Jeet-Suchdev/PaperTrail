@@ -1,0 +1,17 @@
+packages:
+  - server
+  - client
+
+# pnpm blocks dependency build scripts by default (pnpm 11+ calls the
+# allow-list allowBuilds). These three legitimately need theirs: Prisma
+# downloads query engines and esbuild installs its platform binary.
+allowBuilds:
+  '@prisma/engines': true
+  esbuild: true
+  prisma: true
+
+# pnpm 11+ refuses to install versions published less than 24h ago
+# (supply-chain guard). vite 8.3.2 is newer than that window; opted out
+# for this exact version only — the guard stays on for everything else.
+minimumReleaseAgeExclude:
+  - vite@8.3.2
