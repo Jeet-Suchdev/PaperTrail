@@ -91,11 +91,6 @@ pnpm lint           # ESLint
 pnpm format:check   # Prettier
 ```
 
-## Project docs
-
-- [`SPEC.md`](./SPEC.md): product and technical specification
-- [`AGENTS.md`](./AGENTS.md): conventions for AI coding agents working in this repo
-
 ## Disclaimer
 
 PaperTrail is a simulation for learning. It does not execute real trades, does not connect to any broker, and does not provide financial advice. Market data may be delayed or inaccurate.
