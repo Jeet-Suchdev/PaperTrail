@@ -44,7 +44,7 @@ PaperTrail is a full-stack paper-trading web app for NSE/BSE stocks. Start with 
 ## Roadmap
 
 - [x] Foundation (monorepo, Postgres, Prisma, tooling)
-- [ ] Auth and wallet
+- [x] Auth and wallet
 - [ ] Market data service
 - [ ] Trading core (market orders, holdings, P&L)
 - [ ] Realtime dashboard
