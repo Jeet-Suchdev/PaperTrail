@@ -26,6 +26,26 @@ export function numberToPaise(value: number): bigint {
   return BigInt(value);
 }
 
+/**
+ * Rupee float -> integer paise. This is the ONLY place a rupee-denominated
+ * float becomes paise (the market-provider boundary); everything downstream
+ * is integer paise. Rejects NaN, Infinity, negatives, and unsafe results —
+ * bad upstream data must fail loudly, not round into a wrong price.
+ */
+export function rupeesToPaise(rupees: number): number {
+  if (!Number.isFinite(rupees)) {
+    throw new Error(`rupeesToPaise: ${rupees} is not a finite number`);
+  }
+  if (rupees < 0) {
+    throw new Error(`rupeesToPaise: ${rupees} is negative`);
+  }
+  const paise = Math.round(rupees * 100);
+  if (!Number.isSafeInteger(paise)) {
+    throw new Error(`rupeesToPaise: ${rupees} exceeds the safe integer range`);
+  }
+  return paise;
+}
+
 // Display-only. Dividing by 100 here is the single allowed float step —
 // it happens inside the formatter, after all calculations are done.
 // The client keeps a copy of this function (client/src/lib/money.ts).
