@@ -20,8 +20,14 @@ const envSchema = z.object({
   // deployments don't need a second database.
   DATABASE_URL_TEST: z.string().min(1).optional(),
   CLIENT_ORIGIN: z.string().min(1).default('http://localhost:5173'),
-  JWT_SECRET: z.string().min(1, 'JWT_SECRET is required'),
+  JWT_SECRET: z.string().min(32, 'JWT_SECRET must be at least 32 characters'),
   COOKIE_SECURE: envBoolean.default(false),
+  // Single source of truth for session lifetime: JWT expiresIn (seconds)
+  // and cookie Max-Age (milliseconds) both derive from this.
+  SESSION_TTL_DAYS: z.coerce.number().int().positive().default(7),
+  RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900000),
+  RATE_LIMIT_LOGIN_MAX: z.coerce.number().int().positive().default(10),
+  RATE_LIMIT_REGISTER_MAX: z.coerce.number().int().positive().default(5),
   STARTING_BALANCE_PAISE: z.coerce.number().int().positive().default(100000000),
   MARKET_PROVIDER: z.enum(['yahoo', 'simulated']).default('yahoo'),
   PRICE_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(10),

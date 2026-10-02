@@ -14,6 +14,9 @@ if (!process.env.DATABASE_URL_TEST) {
 export default defineConfig({
   test: {
     environment: 'node',
+    // Applies migrations to the test DB (papertrail_test) once before
+    // any test file runs — see src/test/globalSetup.ts.
+    globalSetup: './src/test/globalSetup.ts',
     env: {
       // Every test runs against the dedicated test database, never dev data.
       DATABASE_URL: process.env.DATABASE_URL_TEST,

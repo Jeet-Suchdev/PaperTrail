@@ -1,4 +1,5 @@
 import type { ErrorRequestHandler, RequestHandler } from 'express';
+import { Prisma } from '../generated/prisma/client';
 import { AppError, NotFoundError } from './errors';
 
 // Matches everything that no route handled; Express then walks on to the
@@ -27,6 +28,15 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
         message: err.message,
         ...(err.details !== undefined ? { details: err.details } : {}),
       },
+    });
+    return;
+  }
+
+  // Unique-constraint violation (e.g. duplicate email on register):
+  // a conflict the client can understand, not a bug.
+  if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+    res.status(409).json({
+      error: { code: 'CONFLICT', message: 'A record with that unique value already exists' },
     });
     return;
   }
