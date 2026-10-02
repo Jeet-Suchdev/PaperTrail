@@ -34,12 +34,19 @@ PaperTrail is a full-stack paper-trading web app for NSE/BSE stocks. Start with 
 
 ## Engineering highlights
 
+Implemented:
+
 - **Money is handled as integer paise**, never floating point.
-- **Every trade runs in a single database transaction** with wallet row locking, so concurrent orders can't overspend.
-- **Append-only ledger:** wallet balance always equals the sum of ledger entries, and this invariant is tested.
-- **One price poller serves all users:** the backend polls, caches, and fans out via WebSockets. The frontend never calls the market API.
-- **Graceful degradation:** if the market data provider fails, the app falls back to simulated prices and says so in the UI.
-- **The LLM never does the math:** the backend computes every number, and the model only narrates. Chat answers come from tool calls into existing services.
+- **Registration is atomic:** user, wallet, and opening ledger entry are created in a single database transaction.
+- **Append-only ledger design:** the wallet balance equals the sum of ledger entries, and a test checks it.
+- **Auth done carefully:** argon2id password hashing, httpOnly cookie sessions (no tokens in browser storage), generic login errors, a timing-safe login path, and rate-limited auth routes.
+
+Planned (see roadmap):
+
+- Every trade in a single transaction with wallet row locking
+- One price poller serving all users, with fan-out over WebSockets
+- Automatic fallback to simulated prices when the market data provider fails
+- AI features where the backend computes every number and the model only narrates
 
 ## Roadmap
 
@@ -64,23 +71,26 @@ PaperTrail is a full-stack paper-trading web app for NSE/BSE stocks. Start with 
 ### Setup
 
 ```bash
-pnpm install                           # install workspace dependencies
-docker compose up -d                   # start PostgreSQL (papertrail + papertrail_test)
-cp server/.env.example server/.env     # create your local environment file
-pnpm dev                               # run server (:3001) and client (:5173)
+pnpm install                                     # install workspace dependencies
+docker compose up -d                             # start PostgreSQL (papertrail + papertrail_test)
+cp server/.env.example server/.env               # create your local environment file
+# edit server/.env and set JWT_SECRET to a random string of 32+ characters:
+#   openssl rand -base64 48
+pnpm --filter server prisma migrate dev          # create the database tables
+pnpm dev                                         # run server (:3001) and client (:5173)
 ```
 
-Open http://localhost:5173 — the home page calls `GET /api/health`, which
-runs `SELECT 1` against PostgreSQL, so a green "OK" badge means your whole
-stack (client → server → database) is wired up.
+Open http://localhost:5173, register an account, and you'll land on a dashboard
+showing your ₹10,00,000.00 virtual balance. The `/health` page runs `SELECT 1`
+against PostgreSQL, so a green "OK" badge means client, server, and database
+are all connected.
 
 Notes:
 
-- `pnpm dev` runs `prisma generate` for you. There are **no database
-  migrations yet** — tables arrive with later slices (see the
-  [roadmap](#roadmap)).
+- `pnpm dev` runs `prisma generate` for you.
 - Integration tests run against the separate `papertrail_test` database
-  (`DATABASE_URL_TEST`), so `pnpm test` never touches your dev data.
+  (`DATABASE_URL_TEST`). The test run applies migrations to it automatically,
+  and `pnpm test` never touches your dev data.
 
 ### Useful commands
 
