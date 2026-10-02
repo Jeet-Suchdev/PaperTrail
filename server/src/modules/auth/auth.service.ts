@@ -55,3 +55,16 @@ export async function login(email: string, password: string): Promise<User> {
   }
   return user;
 }
+
+// The single query behind GET /me: user + wallet in one round trip.
+// Returns null when either is missing so the route can send a 401.
+export async function getProfile(userId: string) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    include: { wallet: true },
+  });
+  if (user === null || user.wallet === null) {
+    return null;
+  }
+  return { user, wallet: user.wallet };
+}
