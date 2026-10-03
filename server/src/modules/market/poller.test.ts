@@ -7,8 +7,9 @@ const OPEN_DAY = new Date('2026-10-01T06:00:00.000Z'); // Thu 11:30 IST
 const CLOSED_DAY = new Date('2026-10-03T06:00:00.000Z'); // Sat — market closed
 
 function stubService() {
-  const getQuotes = vi.fn(async (_symbols: string[]): Promise<unknown[]> => []);
-  return { service: { getQuotes } as unknown as MarketService, getQuotes };
+  const refreshQuotes = vi.fn(async (_symbols: string[]): Promise<unknown[]> => []);
+  const service = { refreshQuotes, getQuotes: refreshQuotes } as unknown as MarketService;
+  return { service, refreshQuotes, getQuotes: refreshQuotes };
 }
 
 function makePoller(

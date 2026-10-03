@@ -348,12 +348,11 @@ describe('MarketService per-chunk deadline', () => {
 
   it('aborts at the deadline, classifies TIMEOUT, and never retries afterwards', async () => {
     vi.useFakeTimers();
-    const { service, primary, clock } = setup({
+    const { service, primary, fallback } = setup({
       maxAttempts: 5, // deliberately high: the deadline, not maxAttempts, stops us
       failureThreshold: 5,
       deadlineMs: 10_000,
     });
-    void clock;
     let abortedAtDeadline = false;
     primary.getQuotes.mockImplementation(
       (_symbols, options) =>
@@ -379,16 +378,100 @@ describe('MarketService per-chunk deadline', () => {
 
     expect(abortedAtDeadline).toBe(true); // the provider saw signal.aborted
     expect(primary.getQuotes).toHaveBeenCalledTimes(1); // one attempt, five allowed
-    expect(quotes[0]!.isSimulated).toBe(true); // served, no crash
+    // Deadline expiry in live mode must NOT substitute simulated data:
+    // nothing is returned and nothing is cached.
+    expect(quotes).toEqual([]);
+    expect(fallback.getQuotes).not.toHaveBeenCalled();
     expect(service.getProviderStatus()).toMatchObject({
       mode: 'live',
       consecutiveFailures: 1,
     });
   });
 
+  it('keeps the previous cached quote when the deadline expires (stale beats simulated)', async () => {
+    vi.useFakeTimers();
+    const { service, primary, fallback, cache, clock } = setup({
+      failureThreshold: 5,
+      deadlineMs: 10_000,
+      cacheTtlMs: 60_000,
+    });
+    clock.t = IN_HOURS_MS;
+    // A REAL quote, already older than the TTL (so it is a miss and gets
+    // refreshed) — this is what must survive a deadline expiry.
+    cache.set(
+      makeQuote({
+        symbol: 'RELIANCE',
+        pricePaise: 111_111,
+        asOf: new Date(IN_HOURS_MS - 10 * 60_000).toISOString(),
+      }),
+    );
+    primary.getQuotes.mockImplementation(
+      (_symbols, options) =>
+        new Promise<Quote[]>((_resolve, reject) => {
+          options?.signal?.addEventListener('abort', () => reject(namedError('AbortError')), {
+            once: true,
+          });
+        }),
+    );
+
+    const promise = service.getQuotes(['RELIANCE.NS']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const quotes = await promise;
+
+    expect(quotes).toHaveLength(1);
+    expect(quotes[0]).toMatchObject({ pricePaise: 111_111, isSimulated: false });
+    expect(fallback.getQuotes).not.toHaveBeenCalled();
+    // Cache untouched: still the real (stale) quote, not a simulated one.
+    expect(cache.get('RELIANCE', 'NSE')).toMatchObject({
+      pricePaise: 111_111,
+      isSimulated: false,
+    });
+  });
+
+  it('getQuote: unavailable (not notFound) when the deadline expires with no cache', async () => {
+    vi.useFakeTimers();
+    const { service, primary } = setup({ failureThreshold: 5, deadlineMs: 10_000 });
+    primary.getQuotes.mockImplementation(
+      (_symbols, options) =>
+        new Promise<Quote[]>((_resolve, reject) => {
+          options?.signal?.addEventListener('abort', () => reject(namedError('AbortError')), {
+            once: true,
+          });
+        }),
+    );
+
+    const promise = service.getQuote('RELIANCE.NS');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(await promise).toEqual({ status: 'unavailable' });
+  });
+
+  it('getQuote: notFound when the provider answers with nothing', async () => {
+    const { service, primary } = setup();
+    primary.getQuotes.mockResolvedValue([]);
+    expect(await service.getQuote('NOPE.NS')).toEqual({ status: 'notFound' });
+  });
+
+  it('refreshQuotes always hits upstream (poller ignores cache freshness)', async () => {
+    const { service, primary, cache, clock } = setup({ cacheTtlMs: 120_000 });
+    clock.t = IN_HOURS_MS;
+    cache.set(makeQuote({ pricePaise: 111_111, asOf: new Date(clock.t).toISOString() }));
+    primary.getQuotes.mockResolvedValue([
+      makeQuote({ pricePaise: 222_222, asOf: new Date(clock.t).toISOString() }),
+    ]);
+
+    // getQuotes would serve the fresh cache row...
+    expect((await service.getQuotes(['RELIANCE.NS']))[0]!.pricePaise).toBe(111_111);
+    expect(primary.getQuotes).not.toHaveBeenCalled();
+
+    // ...refreshQuotes (the poller path) refreshes anyway.
+    const refreshed = await service.refreshQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1);
+    expect(refreshed[0]!.pricePaise).toBe(222_222);
+  });
+
   it('aborts a pending backoff sleep instead of waiting it out', async () => {
     vi.useFakeTimers();
-    const { service, primary } = setup({
+    const { service, primary, fallback } = setup({
       maxAttempts: 3,
       backoffBaseMs: 30_000, // the sleep must not outlive the deadline
       deadlineMs: 2_000,
@@ -401,7 +484,9 @@ describe('MarketService per-chunk deadline', () => {
     const quotes = await promise;
 
     expect(primary.getQuotes).toHaveBeenCalledTimes(1); // no second attempt after abort
-    expect(quotes[0]!.isSimulated).toBe(true);
+    // Deadline expiry in live mode: no simulated substitution.
+    expect(quotes).toEqual([]);
+    expect(fallback.getQuotes).not.toHaveBeenCalled();
     expect(service.getProviderStatus().consecutiveFailures).toBe(1);
   });
 
@@ -436,11 +521,27 @@ describe('MarketService per-chunk deadline', () => {
   it('caps a MULTI-chunk request at one deadline, not one per chunk', async () => {
     vi.useFakeTimers();
     try {
-      const { service, primary, fallback } = setup({
+      const { service, primary, fallback, cache, clock } = setup({
         batchSize: 1,
-        failureThreshold: 10, // stay in live mode: deadline is what stops us
+        failureThreshold: 10, // stay in live mode: the deadline is what stops us
         deadlineMs: 10_000,
       });
+      clock.t = IN_HOURS_MS;
+      // Stale-but-real rows for the two chunks the deadline will skip.
+      cache.set(
+        makeQuote({
+          symbol: 'BBB',
+          pricePaise: 22_222,
+          asOf: new Date(IN_HOURS_MS - 10 * 60_000).toISOString(),
+        }),
+      );
+      cache.set(
+        makeQuote({
+          symbol: 'CCC',
+          pricePaise: 33_333,
+          asOf: new Date(IN_HOURS_MS - 10 * 60_000).toISOString(),
+        }),
+      );
       primary.getQuotes.mockImplementation(
         (_symbols, options) =>
           new Promise<Quote[]>((_resolve, reject) => {
@@ -458,12 +559,14 @@ describe('MarketService per-chunk deadline', () => {
       await vi.advanceTimersByTimeAsync(10_000); // one budget, not 3 x 10s
       const quotes = await promise;
 
-      // Chunk 1 hangs until the deadline; chunks 2 and 3 see the aborted
-      // signal and are served simulated WITHOUT calling upstream.
+      // Chunk 1 (AAA) hangs until the deadline with nothing cached: dropped.
+      // Chunks 2 and 3 see the aborted signal and keep their stale real rows.
       expect(primary.getQuotes).toHaveBeenCalledTimes(1);
-      expect(fallback.getQuotes).toHaveBeenCalledTimes(3);
-      expect(quotes).toHaveLength(3);
-      expect(quotes.every((quote) => quote.isSimulated)).toBe(true);
+      expect(fallback.getQuotes).not.toHaveBeenCalled(); // no simulated substitution
+      expect(quotes.map((q) => q.symbol)).toEqual(['BBB', 'CCC']);
+      expect(quotes.every((q) => q.isSimulated === false)).toBe(true);
+      // ONE record for the whole call, not one per skipped chunk.
+      expect(service.getProviderStatus().consecutiveFailures).toBe(1);
     } finally {
       vi.useRealTimers();
     }

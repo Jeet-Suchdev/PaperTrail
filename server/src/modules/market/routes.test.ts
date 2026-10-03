@@ -40,18 +40,27 @@ function makeApp(
       name: 'Reliance Industries Limited',
     },
   ]);
-  const service = { getQuotes, searchInstruments } as unknown as MarketService;
+  // The quote path goes through service.getQuote (single symbol); the batch
+  // method is kept so cache/fetch expectations stay assertable.
+  const getQuote = vi.fn(async (yahooSymbol: string) => {
+    const found = quotes.find((quote) => yahooSymbol.startsWith(quote.symbol));
+    return found ? { status: 'ok' as const, quote: found } : { status: 'notFound' as const };
+  });
+  const service = { getQuotes, getQuote, searchInstruments } as unknown as MarketService;
   const trackedSymbols = new TrackedSymbols();
   const queryService = new MarketQueryService({ service, trackedSymbols });
   const app = createApp({
     marketRouter: createMarketRouter({ queryService, limiters: options.limiters }),
   });
-  return { app, getQuotes, searchInstruments, trackedSymbols };
+  return { app, getQuotes, getQuote, searchInstruments, trackedSymbols };
 }
 
 function authCookie(userId = 'user-123'): string {
   return `session=${jwt.sign({ sub: userId }, env.JWT_SECRET, { expiresIn: '1h' })}`;
 }
+
+// No-op middleware for tests that are not about rate limiting.
+const noopLimiter: RequestHandler = (_req, _res, next) => next();
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -98,12 +107,12 @@ describe('GET /api/market/quote/:symbol', () => {
   });
 
   it('accepts ?exchange=BSE and defaults to NSE', async () => {
-    const { app, getQuotes } = makeApp();
+    const { app, getQuote } = makeApp();
     await request(app).get('/api/market/quote/TCS?exchange=BSE').set('Cookie', authCookie());
-    expect(getQuotes).toHaveBeenCalledWith(['TCS.BO']);
+    expect(getQuote).toHaveBeenCalledWith('TCS.BO');
 
     await request(app).get('/api/market/quote/RELIANCE').set('Cookie', authCookie());
-    expect(getQuotes).toHaveBeenCalledWith(['RELIANCE.NS']);
+    expect(getQuote).toHaveBeenCalledWith('RELIANCE.NS');
   });
 
   it('rejects invalid symbols with a 400 and field details', async () => {
@@ -141,9 +150,31 @@ describe('GET /api/market/quote/:symbol', () => {
     expect(res.body.quote.isSimulated).toBe(true);
   });
 
+  it('503 PRICE_UNAVAILABLE when the budget expired and nothing is cached', async () => {
+    // Real MarketQueryService over a service whose getQuote reports the
+    // deadline outcome — the 503 mapping lives in the query service.
+    const queryService = new MarketQueryService({
+      service: {
+        getQuote: async () => ({ status: 'unavailable' }),
+        searchInstruments: async () => [],
+      } as unknown as MarketService,
+      trackedSymbols: new TrackedSymbols(),
+    });
+    const app = createApp({
+      marketRouter: createMarketRouter({
+        queryService,
+        limiters: { quote: noopLimiter, search: noopLimiter },
+      }),
+    });
+
+    const res = await request(app).get('/api/market/quote/RELIANCE').set('Cookie', authCookie());
+    expect(res.status).toBe(503);
+    expect(res.body.error.code).toBe('PRICE_UNAVAILABLE');
+  });
+
   it('never leaks upstream error messages', async () => {
-    const { app, getQuotes } = makeApp();
-    getQuotes.mockRejectedValue(new Error('fetch failed: raw payload with secret-token-abc'));
+    const { app, getQuote } = makeApp();
+    getQuote.mockRejectedValue(new Error('fetch failed: raw payload with secret-token-abc'));
     const res = await request(app).get('/api/market/quote/RELIANCE').set('Cookie', authCookie());
 
     // An unexpected throw is a bug -> generic 500, internals stay server-side.

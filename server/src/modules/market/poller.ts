@@ -79,7 +79,9 @@ export class PricePoller {
       if (!this.marketOpen(this.now())) return; // closed: serve the last close
       const symbols = this.trackedSymbols.list();
       if (symbols.length === 0) return;
-      await this.service.getQuotes(symbols); // batches + refreshes the cache
+      // refreshQuotes (not getQuotes): a tick always refreshes from upstream.
+      // Symbols skipped by a deadline expiry are simply retried next tick.
+      await this.service.refreshQuotes(symbols); // batches + refreshes the cache
     } catch (error) {
       // MarketService is designed not to throw; if something does, the loop
       // must survive it. Error name only — messages can carry payloads.

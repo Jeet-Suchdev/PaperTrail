@@ -44,7 +44,31 @@ type ChunkResult =
   | { status: 'ok'; quotes: Quote[] }
   | { status: 'empty' }
   | { status: 'badRequest' }
+  | { status: 'deadline' }
   | { status: 'error'; kind: ProviderErrorKind };
+
+/**
+ * What one chunk contributed to a call:
+ * - quotes: real data from the provider,
+ * - none: healthy upstream, symbol(s) genuinely unknown,
+ * - simulated: a real outage (retries exhausted) — simulated data, flagged,
+ * - deadline: the call budget expired. Deliberately NOT simulated: in live
+ *   mode a budget expiry must not mix fake prices into live results, so the
+ *   previous cached quote is kept (even if stale) and the refresh is left to
+ *   the next poller tick.
+ */
+type ChunkOutcome =
+  | { kind: 'quotes'; quotes: Quote[] }
+  | { kind: 'none' }
+  | { kind: 'simulated'; quotes: Quote[] }
+  | { kind: 'deadline' };
+
+/** Result of a single-symbol lookup (the HTTP quote path). */
+export type QuoteLookup =
+  | { status: 'ok'; quote: Quote }
+  | { status: 'notFound' }
+  /** Budget expired and no cached quote exists to fall back on. */
+  | { status: 'unavailable' };
 
 /**
  * Outside market hours (evenings, weekends, holidays — isMarketOpen is
@@ -115,8 +139,8 @@ export class MarketService {
   private consecutiveFailures = 0;
   private cooldownUntil = 0;
   private lastErrorKind: ProviderErrorKind | null = null;
-  /** In-flight upstream calls, keyed by sorted symbol batch (single-flight). */
-  private readonly inFlight = new Map<string, Promise<Quote[]>>();
+  /** In-flight chunk work, keyed by sorted symbol batch (single-flight). */
+  private readonly inFlight = new Map<string, Promise<ChunkOutcome>>();
   /** Normalized query -> last successful non-empty live result. */
   private readonly searchCache = new Map<string, SearchCacheEntry>();
 
@@ -136,7 +160,49 @@ export class MarketService {
     this.modeSince = this.nowMs();
   }
 
+  /** Read path: usable cache hits win, misses go upstream (budgeted). */
   async getQuotes(yahooSymbols: string[]): Promise<Quote[]> {
+    const { quotes } = await this.collect(yahooSymbols, { useCache: true });
+    return quotes;
+  }
+
+  /**
+   * Poller path: always refresh from upstream, ignoring cache freshness (the
+   * TTL governs how long a row may be SERVED to a client, not how often the
+   * poller refreshes it). A deadline expiry leaves the affected symbols at
+   * their previous value and they are retried on the next tick.
+   */
+  async refreshQuotes(yahooSymbols: string[]): Promise<Quote[]> {
+    const { quotes } = await this.collect(yahooSymbols, { useCache: false });
+    return quotes;
+  }
+
+  /** Single-symbol lookup that distinguishes "unknown" from "no data yet". */
+  async getQuote(yahooSymbol: string): Promise<QuoteLookup> {
+    const normalized = yahooSymbol.trim().toUpperCase();
+    const { quotes, deadlineExpired } = await this.collect([normalized], { useCache: true });
+    const quote = this.pickQuote(quotes, normalized);
+    if (quote) return { status: 'ok', quote };
+    return deadlineExpired ? { status: 'unavailable' } : { status: 'notFound' };
+  }
+
+  private pickQuote(quotes: Quote[], yahooSymbol: string): Quote | undefined {
+    const mapped = fromYahooSymbol(yahooSymbol);
+    if (!mapped) return undefined;
+    return quotes.find(
+      (quote) => quote.symbol === mapped.symbol && quote.exchange === mapped.exchange,
+    );
+  }
+
+  /**
+   * Shared body of all three entry points. Chunks are sequential and ONE
+   * deadline covers the whole call (all chunks, attempts and backoffs), so a
+   * black-holed upstream cannot multiply the wait by the number of chunks.
+   */
+  private async collect(
+    yahooSymbols: string[],
+    options: { useCache: boolean },
+  ): Promise<{ quotes: Quote[]; deadlineExpired: boolean }> {
     const requested = [
       ...new Set(
         yahooSymbols
@@ -144,35 +210,57 @@ export class MarketService {
           .filter((symbol) => symbol.length > 0),
       ),
     ];
-    if (requested.length === 0) return [];
+    if (requested.length === 0) return { quotes: [], deadlineExpired: false };
 
     const quotes: Quote[] = [];
     const missing: string[] = [];
     for (const yahooSymbol of requested) {
       const cached = this.cacheLookup(yahooSymbol);
-      if (cached && this.isUsable(cached)) quotes.push(cached);
+      if (options.useCache && cached && this.isUsable(cached)) quotes.push(cached);
       else missing.push(yahooSymbol);
     }
 
     const chunks = chunkList(missing, this.batchSize);
-    // ONE deadline for the whole call, not per chunk: during an outage a
-    // multi-chunk request would otherwise take deadlineMs x chunks (e.g. 30s
-    // for 60 symbols). Chunks run sequentially, so the budget covers all
-    // attempts, backoffs and chunks; chunks that start after it fired are
-    // served simulated without an upstream call.
     const controller = new AbortController();
     const deadline = setTimeout(() => controller.abort(), this.deadlineMs);
+    let deadlineExpired = false;
+    let failureRecorded = false;
     try {
       for (const [index, chunk] of chunks.entries()) {
         // Only the first chunk of a request may probe for recovery: if the
         // threshold tripped on an earlier chunk, the rest are served simulated
         // without any further upstream calls.
-        quotes.push(...(await this.fetchChunk(chunk, index > 0, controller.signal)));
+        const outcome = await this.fetchChunk(chunk, index > 0, controller.signal);
+        if (outcome.kind === 'quotes' || outcome.kind === 'simulated') {
+          quotes.push(...outcome.quotes);
+        }
+        if (outcome.kind === 'deadline') {
+          deadlineExpired = true;
+          // ONE counted record per call, no matter how many chunks were
+          // skipped by the expiry.
+          if (!failureRecorded) {
+            failureRecorded = true;
+            this.recordFailure();
+          }
+          // Keep what we last knew for these symbols — a stale real price is
+          // better than a fabricated one, and nothing is written to the cache.
+          quotes.push(...this.cachedIgnoringFreshness(chunk));
+        }
       }
     } finally {
       clearTimeout(deadline);
     }
-    return quotes;
+    return { quotes, deadlineExpired };
+  }
+
+  /** Cached rows for these symbols regardless of age or mode. */
+  private cachedIgnoringFreshness(yahooSymbols: string[]): Quote[] {
+    const cached: Quote[] = [];
+    for (const yahooSymbol of yahooSymbols) {
+      const quote = this.cacheLookup(yahooSymbol);
+      if (quote) cached.push(quote);
+    }
+    return cached;
   }
 
   async searchInstruments(query: string): Promise<InstrumentSearchResult[]> {
@@ -248,7 +336,11 @@ export class MarketService {
    * Fetch one batch with single-flight: two concurrent callers asking for
    * the same symbols share one upstream call instead of racing.
    */
-  private fetchChunk(chunk: string[], skipProbe: boolean, signal: AbortSignal): Promise<Quote[]> {
+  private fetchChunk(
+    chunk: string[],
+    skipProbe: boolean,
+    signal: AbortSignal,
+  ): Promise<ChunkOutcome> {
     const key = [...chunk].sort().join(',');
     const existing = this.inFlight.get(key);
     if (existing) return existing;
@@ -263,7 +355,7 @@ export class MarketService {
     chunk: string[],
     skipProbe: boolean,
     signal: AbortSignal,
-  ): Promise<Quote[]> {
+  ): Promise<ChunkOutcome> {
     if (this.mode === 'fallback') {
       if (skipProbe || this.nowMs() < this.cooldownUntil) {
         return this.serveSimulated(chunk);
@@ -271,12 +363,11 @@ export class MarketService {
       // Cooldown over: ONE probe (no retry loop — fallback latency matters
       // more than a fast recovery here), under the call deadline.
       const probe = await this.attemptChunk(chunk, signal);
-      if (probe.status === 'error') {
+      if (probe.status === 'error' || probe.status === 'deadline') {
+        const kind = probe.status === 'deadline' ? 'TIMEOUT' : probe.kind;
         this.recordFailure();
         this.cooldownUntil = this.nowMs() + this.cooldownMs;
-        this.logger.warn(
-          `fallback probe failed (${probe.kind}); next attempt in ${this.cooldownMs}ms`,
-        );
+        this.logger.warn(`fallback probe failed (${kind}); next attempt in ${this.cooldownMs}ms`);
         return this.serveSimulated(chunk);
       }
       if (probe.status === 'badRequest') {
@@ -287,7 +378,7 @@ export class MarketService {
         return this.serveSimulated(chunk);
       }
       this.enterLiveMode();
-      return probe.status === 'ok' ? probe.quotes : [];
+      return probe.status === 'ok' ? this.outcomeQuotes(probe.quotes) : this.outcomeNone();
     }
 
     // Live mode: the call deadline governs attempts, backoffs and chunks.
@@ -295,33 +386,47 @@ export class MarketService {
     switch (result.status) {
       case 'ok':
         this.recordSuccess();
-        return result.quotes;
+        return this.outcomeQuotes(result.quotes);
       case 'empty':
         // Healthy upstream, unknown symbol(s): a normal NOT_FOUND.
         this.recordSuccess();
-        return [];
+        return this.outcomeNone();
+      case 'deadline':
+        // Budget spent. NOT simulated in live mode: the caller keeps the
+        // previous cached quote (even if stale) and the poller retries next
+        // tick. The failure itself is counted once per call in collect().
+        this.lastErrorKind = 'TIMEOUT';
+        return { kind: 'deadline' };
       case 'badRequest':
         // Our request was malformed upstream: not an outage, never counted.
         // Serve simulated so the app stays usable, but stay in live mode.
         this.logger.warn('upstream rejected quote request as bad request');
         return this.serveSimulated(chunk);
       case 'error':
-        // Retries exhausted (or the deadline hit): ONE counted record,
-        // simulated served, no crash.
+        // Retries exhausted: ONE counted record, simulated served, no crash.
         this.recordFailure();
         return this.serveSimulated(chunk);
     }
+  }
+
+  private outcomeQuotes(quotes: Quote[]): ChunkOutcome {
+    return { kind: 'quotes', quotes };
+  }
+
+  private outcomeNone(): ChunkOutcome {
+    return { kind: 'none' };
   }
 
   private async attemptChunkWithRetries(
     chunk: string[],
     signal: AbortSignal,
   ): Promise<ChunkResult> {
-    let last: ChunkResult = { status: 'error', kind: 'TIMEOUT' };
+    let last: ChunkResult = { status: 'error', kind: 'UNKNOWN' };
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
-      // The deadline covers the whole chunk: once it has fired we stop, no
-      // further attempts are started.
-      if (signal.aborted) return { status: 'error', kind: 'TIMEOUT' };
+      // The deadline covers the whole call: once it has fired we stop, and NO
+      // further attempt is started (verified by the "never retries after the
+      // deadline" test with maxAttempts deliberately set high).
+      if (signal.aborted) return { status: 'deadline' };
       last = await this.attemptChunk(chunk, signal);
       if (last.status !== 'error') return last;
       if (attempt < this.maxAttempts) {
@@ -338,7 +443,9 @@ export class MarketService {
       this.cacheAll(quotes);
       return quotes.length > 0 ? { status: 'ok', quotes } : { status: 'empty' };
     } catch (error) {
-      if (signal.aborted) return { status: 'error', kind: 'TIMEOUT' };
+      // Aborted by the deadline: distinct from a provider error, because the
+      // caller must not treat a spent budget as an upstream outage verdict.
+      if (signal.aborted) return { status: 'deadline' };
       const classified = classifyProviderError(error);
       if (classified.status === 'badRequest') return { status: 'badRequest' };
       // message deliberately dropped: it may embed upstream payloads.
@@ -347,18 +454,18 @@ export class MarketService {
     }
   }
 
-  private async serveSimulated(chunk: string[]): Promise<Quote[]> {
+  private async serveSimulated(chunk: string[]): Promise<ChunkOutcome> {
     try {
       const quotes = await this.fallback.getQuotes(chunk);
       const marked = quotes.map((quote) => ({ ...quote, isSimulated: true }));
       this.cacheAll(marked);
-      return marked;
+      return { kind: 'simulated', quotes: marked };
     } catch (error) {
       // Name only — never the message (could carry payload from a provider).
       this.logger.warn(
         `simulated fallback failed (${error instanceof Error ? error.name : 'unknown'})`,
       );
-      return [];
+      return this.outcomeNone();
     }
   }
 
