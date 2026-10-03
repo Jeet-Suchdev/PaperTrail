@@ -48,12 +48,22 @@ export interface InstrumentSearchResult {
 }
 
 /**
+ * Per-call controls for a provider fetch. MarketService passes a signal that
+ * aborts at its per-chunk deadline; a provider that talks to the network
+ * MUST stop early when the signal aborts (SimulatedProvider ignores it — it
+ * resolves instantly and has nothing to cancel).
+ */
+export interface ProviderFetchOptions {
+  signal?: AbortSignal;
+}
+
+/**
  * The provider contract (SPEC §6, trimmed to this slice: no getHistory until
  * Slice 5). Unknown/missing symbols are ABSENT from the returned array —
  * they must not throw. A "not found" is a normal answer, not a failure.
  */
 export interface MarketDataProvider {
-  getQuotes(yahooSymbols: string[]): Promise<Quote[]>;
+  getQuotes(yahooSymbols: string[], options?: ProviderFetchOptions): Promise<Quote[]>;
   searchInstruments(query: string): Promise<InstrumentSearchResult[]>;
 }
 

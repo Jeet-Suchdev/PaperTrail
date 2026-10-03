@@ -17,6 +17,7 @@ describe('parseEnv', () => {
     expect(env.RATE_LIMIT_WINDOW_MS).toBe(900000);
     expect(env.RATE_LIMIT_LOGIN_MAX).toBe(10);
     expect(env.RATE_LIMIT_REGISTER_MAX).toBe(5);
+    expect(env.MARKET_CACHE_TTL_SECONDS).toBe(120);
   });
 
   it('rejects a JWT_SECRET shorter than 32 characters', () => {
@@ -56,5 +57,24 @@ describe('parseEnv', () => {
     expect(() => parseEnv({ ...minimalValidEnv, MARKET_PROVIDER: 'bloomberg' })).toThrow(
       /MARKET_PROVIDER/,
     );
+  });
+
+  it('rejects a cache TTL below twice the poll interval', () => {
+    expect(() =>
+      parseEnv({
+        ...minimalValidEnv,
+        PRICE_POLL_INTERVAL_SECONDS: '10',
+        MARKET_CACHE_TTL_SECONDS: '19',
+      }),
+    ).toThrow(/MARKET_CACHE_TTL_SECONDS/);
+  });
+
+  it('accepts a cache TTL of exactly twice the poll interval', () => {
+    const env = parseEnv({
+      ...minimalValidEnv,
+      PRICE_POLL_INTERVAL_SECONDS: '10',
+      MARKET_CACHE_TTL_SECONDS: '20',
+    });
+    expect(env.MARKET_CACHE_TTL_SECONDS).toBe(20);
   });
 });

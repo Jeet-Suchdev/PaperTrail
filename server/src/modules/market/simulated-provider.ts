@@ -9,7 +9,12 @@
 import { rupeesToPaise } from '../../lib/money';
 import { changePercentFromPaise } from './change-percent';
 import { fromYahooSymbol, toYahooSymbol } from './symbol-map';
-import type { InstrumentSearchResult, MarketDataProvider, Quote } from './types';
+import type {
+  InstrumentSearchResult,
+  MarketDataProvider,
+  ProviderFetchOptions,
+  Quote,
+} from './types';
 
 interface SimulatedInstrument {
   name: string;
@@ -84,7 +89,8 @@ export class SimulatedProvider implements MarketDataProvider {
     this.getLastKnownPricePaise = options.getLastKnownPricePaise;
   }
 
-  async getQuotes(yahooSymbols: string[]): Promise<Quote[]> {
+  // No network and nothing to cancel: the deadline signal is ignored here.
+  async getQuotes(yahooSymbols: string[], _options: ProviderFetchOptions = {}): Promise<Quote[]> {
     const quotes: Quote[] = [];
     for (const yahooSymbol of yahooSymbols) {
       const quote = this.buildQuote(yahooSymbol);

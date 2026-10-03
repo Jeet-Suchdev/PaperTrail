@@ -23,10 +23,19 @@ import { changePercentFromPaise } from './change-percent';
 import { createConsoleMarketLogger, type MarketLogger } from './market-logger';
 import { MarketValidationError } from './provider-errors';
 import { fromYahooSymbol, toYahooSymbol } from './symbol-map';
-import type { InstrumentSearchResult, MarketDataProvider, Quote } from './types';
+import type {
+  InstrumentSearchResult,
+  MarketDataProvider,
+  ProviderFetchOptions,
+  Quote,
+} from './types';
 import { yahooQuoteSchema, yahooSearchItemSchema, type YahooQuotePayload } from './yahoo.schemas';
 
-const DEFAULT_TIMEOUT_MS = 5_000;
+// Per-HTTP-request timeout (the library's queue `timeout` option is a no-op:
+// the queue assigns it to a property nothing reads). 4s covers the crumb +
+// quote round trip (~750ms measured live in Checkpoint 1) with margin while
+// keeping the per-chunk deadline (MarketService, 10s) the real budget.
+const DEFAULT_TIMEOUT_MS = 4_000;
 const SEARCH_QUOTES_COUNT = 10;
 
 /** The default export is a value (factory/class), not usable as a type. */
@@ -58,7 +67,7 @@ export function createTimeoutFetch(timeoutMs: number, upstream: typeof fetch): t
 }
 
 export interface YahooProviderOptions {
-  /** Per-request timeout in ms (default 5000). */
+  /** Per-request timeout in ms (default 4000). */
   timeoutMs?: number;
   logger?: MarketLogger;
   /** Clock for asOf; injectable for deterministic tests. */
@@ -85,7 +94,7 @@ export class YahooProvider implements MarketDataProvider {
     });
   }
 
-  async getQuotes(yahooSymbols: string[]): Promise<Quote[]> {
+  async getQuotes(yahooSymbols: string[], options: ProviderFetchOptions = {}): Promise<Quote[]> {
     const requested = [
       ...new Set(
         yahooSymbols
@@ -95,7 +104,17 @@ export class YahooProvider implements MarketDataProvider {
     ];
     if (requested.length === 0) return [];
 
-    const raw = await this.client.quote(requested, {}, { validateResult: false });
+    // fetchOptions.signal rides along on every request of this call (quote and
+    // crumb fetch alike); our timeout wrapper forwards the abort, so the
+    // caller's deadline really cancels the HTTP work.
+    const raw = await this.client.quote(
+      requested,
+      {},
+      {
+        validateResult: false,
+        fetchOptions: options.signal ? { signal: options.signal } : {},
+      },
+    );
     const rawQuotes: unknown[] = Array.isArray(raw) ? raw : [];
     // Yahoo silently skips symbols it doesn't know: an empty answer is a
     // normal NOT_FOUND, not a failure.

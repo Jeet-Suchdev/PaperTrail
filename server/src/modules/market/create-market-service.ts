@@ -35,12 +35,18 @@ export function createMarketService(
 ): MarketService {
   const seedFromCache = makeCachePriceLookup(cache);
   const simulated = new SimulatedProvider({ getLastKnownPricePaise: seedFromCache });
+  const fromEnv = {
+    // Cache freshness in market hours; env validates it is >= 2x the poll
+    // interval so a poller tick keeps rows fresh.
+    cacheTtlMs: env.MARKET_CACHE_TTL_SECONDS * 1000,
+  };
 
   if (env.MARKET_PROVIDER === 'simulated') {
     return new MarketService({
       provider: simulated,
       fallback: simulated,
       cache,
+      ...fromEnv,
       ...overrides,
     });
   }
@@ -49,6 +55,7 @@ export function createMarketService(
     provider: new YahooProvider(),
     fallback: simulated,
     cache,
+    ...fromEnv,
     ...overrides,
   });
 }

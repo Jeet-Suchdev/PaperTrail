@@ -31,6 +31,11 @@ const envSchema = z.object({
   STARTING_BALANCE_PAISE: z.coerce.number().int().positive().default(100000000),
   MARKET_PROVIDER: z.enum(['yahoo', 'simulated']).default('yahoo'),
   PRICE_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(10),
+  // How long a cached quote may be served (market hours). Kept separate from
+  // MAX_PRICE_AGE_SECONDS (order staleness) — a short order window must not
+  // thrash the cache. Must be >= 2x the poll interval so a poller tick keeps
+  // the cache warm; enforced below.
+  MARKET_CACHE_TTL_SECONDS: z.coerce.number().int().positive().default(120),
   MAX_PRICE_AGE_SECONDS: z.coerce.number().int().positive().default(120),
   ALLOW_AFTER_HOURS_TRADING: envBoolean.default(false),
   LLM_PROVIDER: z.string().default(''),
@@ -41,8 +46,18 @@ const envSchema = z.object({
 
 export type Env = z.infer<typeof envSchema>;
 
+// Cross-field check: a cache TTL shorter than two poll intervals means the
+// poller can never keep a row fresh and every request would refetch.
+const validatedEnvSchema = envSchema.refine(
+  (value) => value.MARKET_CACHE_TTL_SECONDS >= 2 * value.PRICE_POLL_INTERVAL_SECONDS,
+  {
+    message: 'MARKET_CACHE_TTL_SECONDS must be at least 2x PRICE_POLL_INTERVAL_SECONDS',
+    path: ['MARKET_CACHE_TTL_SECONDS'],
+  },
+);
+
 export function parseEnv(raw: NodeJS.ProcessEnv): Env {
-  const result = envSchema.safeParse(raw);
+  const result = validatedEnvSchema.safeParse(raw);
   if (!result.success) {
     const details = result.error.issues
       .map((issue) => `  - ${issue.path.join('.') || 'env'}: ${issue.message}`)

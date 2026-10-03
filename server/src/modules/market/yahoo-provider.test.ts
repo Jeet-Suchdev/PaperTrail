@@ -88,7 +88,14 @@ describe('YahooProvider.getQuotes', () => {
 
     await provider.getQuotes([' reliance.ns ', 'RELIANCE.NS', 'RELIANCE.NS']);
     expect(yahooMock.quote).toHaveBeenCalledTimes(1);
-    expect(yahooMock.quote).toHaveBeenCalledWith(['RELIANCE.NS'], {}, { validateResult: false });
+    expect(yahooMock.quote).toHaveBeenCalledWith(
+      ['RELIANCE.NS'],
+      {},
+      {
+        validateResult: false,
+        fetchOptions: {},
+      },
+    );
   });
 
   it('skips the library entirely for empty input', async () => {
@@ -235,5 +242,87 @@ describe('createTimeoutFetch', () => {
     const response = await timeoutFetch('http://fast.example', {});
     expect(await response.text()).toBe('ok');
     expect(fast).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the upstream request when the caller signal aborts', async () => {
+    let upstreamSignal: AbortSignal | null = null;
+    const upstream = vi.fn((_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      upstreamSignal = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+          once: true,
+        });
+      });
+    });
+
+    const controller = new AbortController();
+    const wrapped = createTimeoutFetch(4_000, upstream as typeof fetch);
+    const promise = wrapped('http://example.test', { signal: controller.signal });
+    controller.abort();
+
+    await expect(promise).rejects.toMatchObject({ name: 'AbortError' });
+    expect(upstreamSignal!.aborted).toBe(true);
+  });
+
+  it('enforces a 4000ms default per-request timeout (fake timers)', async () => {
+    vi.useFakeTimers();
+    try {
+      const never = vi.fn(
+        (_input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), {
+              once: true,
+            });
+          }),
+      );
+      makeProvider({ fetch: never as typeof fetch }); // no timeoutMs -> default
+      const options = yahooMock.constructorOptions[0] as { fetch: typeof fetch };
+
+      let settled = false;
+      const promise = options
+        .fetch('http://example.test', {})
+        .finally(() => (settled = true))
+        .catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(3_999);
+      expect(settled).toBe(false); // not a second early
+      await vi.advanceTimersByTimeAsync(1);
+      expect(await promise).toMatchObject({ name: 'AbortError' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('YahooProvider deadline signal', () => {
+  it("passes the caller's signal to the library as fetchOptions.signal", async () => {
+    yahooMock.quote.mockResolvedValue([quoteReliance]);
+    const { provider } = makeProvider();
+    const controller = new AbortController();
+
+    await provider.getQuotes(['RELIANCE.NS'], { signal: controller.signal });
+    expect(yahooMock.quote).toHaveBeenCalledWith(
+      ['RELIANCE.NS'],
+      {},
+      {
+        validateResult: false,
+        fetchOptions: { signal: controller.signal },
+      },
+    );
+  });
+
+  it('omits fetchOptions when no signal is supplied', async () => {
+    yahooMock.quote.mockResolvedValue([quoteReliance]);
+    const { provider } = makeProvider();
+
+    await provider.getQuotes(['RELIANCE.NS']);
+    expect(yahooMock.quote).toHaveBeenCalledWith(
+      ['RELIANCE.NS'],
+      {},
+      {
+        validateResult: false,
+        fetchOptions: {},
+      },
+    );
   });
 });

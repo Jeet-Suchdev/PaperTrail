@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MarketService, type MarketServiceOptions } from './market-service';
 import { InMemoryPriceCache } from './price-cache';
@@ -271,7 +271,7 @@ describe('MarketService batching and single-flight', () => {
 
     await service.getQuotes(['reliance.ns', 'RELIANCE.NS', ' RELIANCE.NS ']);
     expect(primary.getQuotes).toHaveBeenCalledTimes(1);
-    expect(primary.getQuotes).toHaveBeenCalledWith(['RELIANCE.NS']);
+    expect(primary.getQuotes.mock.calls[0]![0]).toEqual(['RELIANCE.NS']);
   });
 
   it('shares one upstream call between concurrent identical requests', async () => {
@@ -338,5 +338,225 @@ describe('MarketService.getProviderStatus', () => {
     expect(status.mode).toBe('live');
     expect(status.consecutiveFailures).toBe(0);
     expect(Number.isNaN(Date.parse(status.since))).toBe(false);
+  });
+});
+
+describe('MarketService per-chunk deadline', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('aborts at the deadline, classifies TIMEOUT, and never retries afterwards', async () => {
+    vi.useFakeTimers();
+    const { service, primary, clock } = setup({
+      maxAttempts: 5, // deliberately high: the deadline, not maxAttempts, stops us
+      failureThreshold: 5,
+      deadlineMs: 10_000,
+    });
+    void clock;
+    let abortedAtDeadline = false;
+    primary.getQuotes.mockImplementation(
+      (_symbols, options) =>
+        new Promise<Quote[]>((_resolve, reject) => {
+          if (!options?.signal) {
+            reject(new Error('provider received no signal'));
+            return;
+          }
+          options.signal.addEventListener(
+            'abort',
+            () => {
+              abortedAtDeadline = options.signal!.aborted;
+              reject(namedError('AbortError'));
+            },
+            { once: true },
+          );
+        }),
+    );
+
+    const promise = service.getQuotes(['RELIANCE.NS']);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const quotes = await promise;
+
+    expect(abortedAtDeadline).toBe(true); // the provider saw signal.aborted
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // one attempt, five allowed
+    expect(quotes[0]!.isSimulated).toBe(true); // served, no crash
+    expect(service.getProviderStatus()).toMatchObject({
+      mode: 'live',
+      consecutiveFailures: 1,
+    });
+  });
+
+  it('aborts a pending backoff sleep instead of waiting it out', async () => {
+    vi.useFakeTimers();
+    const { service, primary } = setup({
+      maxAttempts: 3,
+      backoffBaseMs: 30_000, // the sleep must not outlive the deadline
+      deadlineMs: 2_000,
+      failureThreshold: 5,
+    });
+    primary.getQuotes.mockRejectedValue(namedError('TypeError'));
+
+    const promise = service.getQuotes(['RELIANCE.NS']);
+    await vi.advanceTimersByTimeAsync(2_000); // deadline, not the 30s backoff
+    const quotes = await promise;
+
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // no second attempt after abort
+    expect(quotes[0]!.isSimulated).toBe(true);
+    expect(service.getProviderStatus().consecutiveFailures).toBe(1);
+  });
+
+  it('records ONE failure per exhausted chunk, not one per attempt', async () => {
+    const { service, primary } = setup({ maxAttempts: 3, failureThreshold: 2 });
+    primary.getQuotes.mockRejectedValue(namedError('TypeError'));
+
+    await service.getQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(3); // three attempts…
+    expect(service.getProviderStatus()).toMatchObject({
+      mode: 'live', // …but one record, so 2 records need a second exhausted chunk
+      consecutiveFailures: 1,
+    });
+  });
+
+  it('serves remaining chunks from fallback once the threshold trips mid-request', async () => {
+    const { service, primary, fallback } = setup({
+      batchSize: 1,
+      failureThreshold: 1,
+      maxAttempts: 1,
+    });
+    primary.getQuotes.mockRejectedValue(namedError('TypeError'));
+
+    const quotes = await service.getQuotes(['AAA.NS', 'BBB.NS', 'CCC.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // chunk 2+ never went upstream
+    expect(fallback.getQuotes).toHaveBeenCalledTimes(3); // chunk 1..3 all served
+    expect(quotes).toHaveLength(3);
+    expect(quotes.every((quote) => quote.isSimulated)).toBe(true);
+    expect(service.getProviderStatus().mode).toBe('fallback');
+  });
+});
+
+// 2026-10-01 is a Thursday: 06:00Z = 11:30 IST, inside market hours.
+const IN_HOURS_MS = Date.parse('2026-10-01T06:00:00.000Z');
+// 2026-10-03 is a Saturday: market closed whatever the time of day.
+const AFTER_HOURS_MS = Date.parse('2026-10-03T12:00:00.000Z');
+
+describe('MarketService cache freshness window', () => {
+  it('serves a cached quote inside the TTL and refetches past it (market hours)', async () => {
+    const { service, primary, cache, clock } = setup({ cacheTtlMs: 120_000 });
+    clock.t = IN_HOURS_MS;
+    cache.set(makeQuote({ asOf: new Date(IN_HOURS_MS).toISOString(), pricePaise: 111_111 }));
+
+    clock.t = IN_HOURS_MS + 119_000;
+    expect(await service.getQuotes(['RELIANCE.NS'])).toHaveLength(1);
+    expect(primary.getQuotes).not.toHaveBeenCalled(); // fresh
+
+    clock.t = IN_HOURS_MS + 121_000;
+    primary.getQuotes.mockResolvedValue([
+      makeQuote({ pricePaise: 222_222, asOf: new Date(clock.t).toISOString() }),
+    ]);
+    const quotes = await service.getQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // stale -> refetched
+    expect(quotes[0]!.pricePaise).toBe(222_222);
+  });
+
+  it('uses a fixed 30-minute window after hours so weekend lookups do not refetch', async () => {
+    const { service, primary, cache, clock } = setup({ cacheTtlMs: 120_000 });
+    clock.t = AFTER_HOURS_MS;
+    cache.set(makeQuote({ asOf: new Date(AFTER_HOURS_MS).toISOString(), pricePaise: 111_111 }));
+
+    clock.t = AFTER_HOURS_MS + 29 * 60_000;
+    expect(await service.getQuotes(['RELIANCE.NS'])).toHaveLength(1);
+    expect(primary.getQuotes).not.toHaveBeenCalled(); // 29min < 30min window
+
+    clock.t = AFTER_HOURS_MS + 31 * 60_000;
+    primary.getQuotes.mockResolvedValue([
+      makeQuote({ pricePaise: 222_222, asOf: new Date(clock.t).toISOString() }),
+    ]);
+    await service.getQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // past 30min -> refetched
+  });
+
+  it('refetches a 29-minute-old row during market hours (contrast with after hours)', async () => {
+    const { service, primary, cache, clock } = setup({ cacheTtlMs: 120_000 });
+    clock.t = IN_HOURS_MS;
+    cache.set(makeQuote({ asOf: new Date(IN_HOURS_MS).toISOString(), pricePaise: 111_111 }));
+
+    clock.t = IN_HOURS_MS + 29 * 60_000;
+    primary.getQuotes.mockResolvedValue([
+      makeQuote({ pricePaise: 222_222, asOf: new Date(clock.t).toISOString() }),
+    ]);
+    await service.getQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1); // 29min > 120s TTL
+  });
+
+  it('ignores an unparseable asOf and refetches', async () => {
+    const { service, primary, cache, clock } = setup({ cacheTtlMs: 120_000 });
+    clock.t = IN_HOURS_MS;
+    cache.set(makeQuote({ asOf: 'not-a-timestamp' }));
+
+    primary.getQuotes.mockResolvedValue([makeQuote({ asOf: new Date(clock.t).toISOString() })]);
+    await service.getQuotes(['RELIANCE.NS']);
+    expect(primary.getQuotes).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('MarketService search cache', () => {
+  const result = {
+    symbol: 'RELIANCE',
+    exchange: 'NSE' as const,
+    yahooSymbol: 'RELIANCE.NS',
+    name: 'Reliance Industries Limited',
+  };
+
+  it('caches successful non-empty results for 60s under a normalized key', async () => {
+    const { service, primary, clock } = setup();
+    primary.searchInstruments.mockResolvedValue([result]);
+
+    await service.searchInstruments('reliance');
+    await service.searchInstruments('  RELIANCE  '); // same normalized key
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(1);
+
+    clock.t += 61_000;
+    await service.searchInstruments('reliance');
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(2); // TTL expired
+  });
+
+  it('does not cache empty results', async () => {
+    const { service, primary } = setup();
+    primary.searchInstruments.mockResolvedValue([]);
+
+    expect(await service.searchInstruments('reliance')).toEqual([]);
+    expect(await service.searchInstruments('reliance')).toEqual([]);
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not cache fallback results from a failed search', async () => {
+    const { service, primary, fallback } = setup();
+    primary.searchInstruments.mockRejectedValue(namedError('TypeError'));
+    fallback.searchInstruments.mockResolvedValue([{ ...result, name: 'Simulated' }]);
+
+    const first = await service.searchInstruments('reliance');
+    expect(first[0]!.name).toBe('Simulated');
+
+    primary.searchInstruments.mockResolvedValue([result]);
+    await service.searchInstruments('reliance');
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(2); // nothing was cached
+
+    await service.searchInstruments('reliance');
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(2); // now cached
+  });
+
+  it('evicts the oldest entry beyond 100 cached queries', async () => {
+    const { service, primary } = setup();
+    primary.searchInstruments.mockImplementation(async (query: string) => [
+      { ...result, symbol: query.toUpperCase(), yahooSymbol: `${query.toUpperCase()}.NS` },
+    ]);
+
+    for (let i = 0; i < 101; i++) await service.searchInstruments(`q${i}`);
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(101);
+
+    await service.searchInstruments('q0'); // oldest was evicted
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(102);
+    await service.searchInstruments('q100'); // newest still cached
+    expect(primary.searchInstruments).toHaveBeenCalledTimes(102);
   });
 });
