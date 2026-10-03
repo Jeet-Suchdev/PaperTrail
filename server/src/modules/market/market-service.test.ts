@@ -432,6 +432,42 @@ describe('MarketService per-chunk deadline', () => {
     expect(quotes.every((quote) => quote.isSimulated)).toBe(true);
     expect(service.getProviderStatus().mode).toBe('fallback');
   });
+
+  it('caps a MULTI-chunk request at one deadline, not one per chunk', async () => {
+    vi.useFakeTimers();
+    try {
+      const { service, primary, fallback } = setup({
+        batchSize: 1,
+        failureThreshold: 10, // stay in live mode: deadline is what stops us
+        deadlineMs: 10_000,
+      });
+      primary.getQuotes.mockImplementation(
+        (_symbols, options) =>
+          new Promise<Quote[]>((_resolve, reject) => {
+            if (!options?.signal) {
+              reject(new Error('provider received no signal'));
+              return;
+            }
+            options.signal.addEventListener('abort', () => reject(namedError('AbortError')), {
+              once: true,
+            });
+          }),
+      );
+
+      const promise = service.getQuotes(['AAA.NS', 'BBB.NS', 'CCC.NS']);
+      await vi.advanceTimersByTimeAsync(10_000); // one budget, not 3 x 10s
+      const quotes = await promise;
+
+      // Chunk 1 hangs until the deadline; chunks 2 and 3 see the aborted
+      // signal and are served simulated WITHOUT calling upstream.
+      expect(primary.getQuotes).toHaveBeenCalledTimes(1);
+      expect(fallback.getQuotes).toHaveBeenCalledTimes(3);
+      expect(quotes).toHaveLength(3);
+      expect(quotes.every((quote) => quote.isSimulated)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 // 2026-10-01 is a Thursday: 06:00Z = 11:30 IST, inside market hours.

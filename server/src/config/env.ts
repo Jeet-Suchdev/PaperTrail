@@ -28,6 +28,8 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(900000),
   RATE_LIMIT_LOGIN_MAX: z.coerce.number().int().positive().default(10),
   RATE_LIMIT_REGISTER_MAX: z.coerce.number().int().positive().default(5),
+  // Market routes are keyed by user id (not IP), so this is a per-user cap.
+  RATE_LIMIT_MARKET_MAX: z.coerce.number().int().positive().default(120),
   STARTING_BALANCE_PAISE: z.coerce.number().int().positive().default(100000000),
   MARKET_PROVIDER: z.enum(['yahoo', 'simulated']).default('yahoo'),
   PRICE_POLL_INTERVAL_SECONDS: z.coerce.number().int().positive().default(10),

@@ -74,8 +74,9 @@ export interface MarketServiceOptions {
   /** Base backoff in ms; doubles each retry: 250, 500 (default 250). */
   backoffBaseMs?: number;
   /**
-   * Hard wall-clock budget for ONE chunk: all attempts plus backoffs
-   * (default 10000). The signal aborts the upstream request at the deadline.
+   * Hard wall-clock budget for ONE getQuotes call — all chunks, all attempts,
+   * all backoffs (default 10000). The signal aborts upstream requests at the
+   * deadline.
    */
   deadlineMs?: number;
   /** Cache freshness in market hours (default 120000 = 120s). */
@@ -154,11 +155,22 @@ export class MarketService {
     }
 
     const chunks = chunkList(missing, this.batchSize);
-    for (const [index, chunk] of chunks.entries()) {
-      // Only the first chunk of a request may probe for recovery: if the
-      // threshold tripped on an earlier chunk, the rest are served simulated
-      // without any further upstream calls.
-      quotes.push(...(await this.fetchChunk(chunk, index > 0)));
+    // ONE deadline for the whole call, not per chunk: during an outage a
+    // multi-chunk request would otherwise take deadlineMs x chunks (e.g. 30s
+    // for 60 symbols). Chunks run sequentially, so the budget covers all
+    // attempts, backoffs and chunks; chunks that start after it fired are
+    // served simulated without an upstream call.
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), this.deadlineMs);
+    try {
+      for (const [index, chunk] of chunks.entries()) {
+        // Only the first chunk of a request may probe for recovery: if the
+        // threshold tripped on an earlier chunk, the rest are served simulated
+        // without any further upstream calls.
+        quotes.push(...(await this.fetchChunk(chunk, index > 0, controller.signal)));
+      }
+    } finally {
+      clearTimeout(deadline);
     }
     return quotes;
   }
@@ -236,74 +248,68 @@ export class MarketService {
    * Fetch one batch with single-flight: two concurrent callers asking for
    * the same symbols share one upstream call instead of racing.
    */
-  private fetchChunk(chunk: string[], skipProbe: boolean): Promise<Quote[]> {
+  private fetchChunk(chunk: string[], skipProbe: boolean, signal: AbortSignal): Promise<Quote[]> {
     const key = [...chunk].sort().join(',');
     const existing = this.inFlight.get(key);
     if (existing) return existing;
-    const promise = this.runChunk(chunk, skipProbe).finally(() => this.inFlight.delete(key));
+    const promise = this.runChunk(chunk, skipProbe, signal).finally(() =>
+      this.inFlight.delete(key),
+    );
     this.inFlight.set(key, promise);
     return promise;
   }
 
-  private async runChunk(chunk: string[], skipProbe: boolean): Promise<Quote[]> {
+  private async runChunk(
+    chunk: string[],
+    skipProbe: boolean,
+    signal: AbortSignal,
+  ): Promise<Quote[]> {
     if (this.mode === 'fallback') {
       if (skipProbe || this.nowMs() < this.cooldownUntil) {
         return this.serveSimulated(chunk);
       }
       // Cooldown over: ONE probe (no retry loop — fallback latency matters
-      // more than a fast recovery here), under the same deadline.
-      const controller = new AbortController();
-      const deadline = setTimeout(() => controller.abort(), this.deadlineMs);
-      try {
-        const probe = await this.attemptChunk(chunk, controller.signal);
-        if (probe.status === 'error') {
-          this.recordFailure();
-          this.cooldownUntil = this.nowMs() + this.cooldownMs;
-          this.logger.warn(
-            `fallback probe failed (${probe.kind}); next attempt in ${this.cooldownMs}ms`,
-          );
-          return this.serveSimulated(chunk);
-        }
-        if (probe.status === 'badRequest') {
-          // A malformed request won't fix itself: pause probing too, so we
-          // don't hammer upstream with the same bad request on every call.
-          this.cooldownUntil = this.nowMs() + this.cooldownMs;
-          this.logger.warn('upstream rejected probe as bad request');
-          return this.serveSimulated(chunk);
-        }
-        this.enterLiveMode();
-        return probe.status === 'ok' ? probe.quotes : [];
-      } finally {
-        clearTimeout(deadline);
+      // more than a fast recovery here), under the call deadline.
+      const probe = await this.attemptChunk(chunk, signal);
+      if (probe.status === 'error') {
+        this.recordFailure();
+        this.cooldownUntil = this.nowMs() + this.cooldownMs;
+        this.logger.warn(
+          `fallback probe failed (${probe.kind}); next attempt in ${this.cooldownMs}ms`,
+        );
+        return this.serveSimulated(chunk);
       }
+      if (probe.status === 'badRequest') {
+        // A malformed request won't fix itself: pause probing too, so we
+        // don't hammer upstream with the same bad request on every call.
+        this.cooldownUntil = this.nowMs() + this.cooldownMs;
+        this.logger.warn('upstream rejected probe as bad request');
+        return this.serveSimulated(chunk);
+      }
+      this.enterLiveMode();
+      return probe.status === 'ok' ? probe.quotes : [];
     }
 
-    // Live mode: one deadline covers every attempt plus the backoffs.
-    const controller = new AbortController();
-    const deadline = setTimeout(() => controller.abort(), this.deadlineMs);
-    try {
-      const result = await this.attemptChunkWithRetries(chunk, controller.signal);
-      switch (result.status) {
-        case 'ok':
-          this.recordSuccess();
-          return result.quotes;
-        case 'empty':
-          // Healthy upstream, unknown symbol(s): a normal NOT_FOUND.
-          this.recordSuccess();
-          return [];
-        case 'badRequest':
-          // Our request was malformed upstream: not an outage, never counted.
-          // Serve simulated so the app stays usable, but stay in live mode.
-          this.logger.warn('upstream rejected quote request as bad request');
-          return this.serveSimulated(chunk);
-        case 'error':
-          // Retries exhausted (or the deadline hit): ONE counted record,
-          // simulated served, no crash.
-          this.recordFailure();
-          return this.serveSimulated(chunk);
-      }
-    } finally {
-      clearTimeout(deadline);
+    // Live mode: the call deadline governs attempts, backoffs and chunks.
+    const result = await this.attemptChunkWithRetries(chunk, signal);
+    switch (result.status) {
+      case 'ok':
+        this.recordSuccess();
+        return result.quotes;
+      case 'empty':
+        // Healthy upstream, unknown symbol(s): a normal NOT_FOUND.
+        this.recordSuccess();
+        return [];
+      case 'badRequest':
+        // Our request was malformed upstream: not an outage, never counted.
+        // Serve simulated so the app stays usable, but stay in live mode.
+        this.logger.warn('upstream rejected quote request as bad request');
+        return this.serveSimulated(chunk);
+      case 'error':
+        // Retries exhausted (or the deadline hit): ONE counted record,
+        // simulated served, no crash.
+        this.recordFailure();
+        return this.serveSimulated(chunk);
     }
   }
 
