@@ -7,6 +7,7 @@
     "dev": "prisma generate && tsx watch src/index.ts",
     "start": "tsx src/index.ts",
     "generate": "prisma generate",
+    "smoke:market": "tsx src/scripts/smoke-market.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

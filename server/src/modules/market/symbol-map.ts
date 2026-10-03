@@ -38,7 +38,9 @@ export function toYahooSymbol(symbol: string, exchange: Exchange): string | null
  * unknown suffixes, extra dots ('FOO.BAR.NS'), whitespace, or missing
  * suffixes all fail. Matching is case-insensitive (input is uppercased).
  */
-export function fromYahooSymbol(yahooSymbol: string): { symbol: string; exchange: Exchange } | null {
+export function fromYahooSymbol(
+  yahooSymbol: string,
+): { symbol: string; exchange: Exchange } | null {
   const normalized = yahooSymbol.toUpperCase();
   for (const [exchange, suffix] of Object.entries(SUFFIX_BY_EXCHANGE) as [Exchange, string][]) {
     if (normalized.endsWith(suffix)) {

@@ -9,6 +9,7 @@
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true,
     "isolatedModules": true,
+    "resolveJsonModule": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,

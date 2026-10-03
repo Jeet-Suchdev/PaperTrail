@@ -29,6 +29,10 @@ export default defineConfig({
       // of any skip logic in the code.
       RATE_LIMIT_LOGIN_MAX: '1000000',
       RATE_LIMIT_REGISTER_MAX: '1000000',
+      // Tests never touch the real Yahoo API (Checkpoint 3): the default
+      // provider under test is the simulated one. Individual tests can still
+      // flip this to 'yahoo' via vi.stubEnv + module re-import.
+      MARKET_PROVIDER: 'simulated',
     },
   },
 });

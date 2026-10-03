@@ -1,11 +1,11 @@
 // Our own thin Zod parse of the Yahoo quote payload — only the fields we
-// actually use (Checkpoint 1 amendments). The yahoo-finance2 library ships
+// actually use (Checkpoint 1 amendments). The upstream library ships
 // its own validation, but we treat everything crossing the provider boundary
 // as untrusted: if a field is missing or the wrong type, this parse fails
 // loudly (a VALIDATION failure that counts toward the failure counter) rather
 // than producing a wrong price. Unknown fields are stripped by z.object.
 //
-// No yahoo-finance2 import here — this file must stay pure so it can be
+// No upstream import here — this file must stay pure so it can be
 // tested and reasoned about without the library.
 //
 // CHECKPOINT 3 NOTE: parse PER ITEM — one yahooQuoteSchema.parse per quote in
@@ -36,3 +36,22 @@ export const yahooQuoteSchema = z.object({
 });
 
 export type YahooQuotePayload = z.infer<typeof yahooQuoteSchema>;
+
+/**
+ * Search-result item, thin parse (Checkpoint 3). Non-Yahoo hits fail the
+ * `isYahooFinance: true` literal (they also lack `symbol`) — dropped without
+ * logging: they are normal noise, not malformed data. Exchange/quoteType are
+ * kept as strings here; the provider decides which values are acceptable
+ * (NSI/BSE + EQUITY), because Yahoo uses exchange codes we don't support
+ * (NYQ, NCM, ...) for perfectly well-formed rows.
+ */
+export const yahooSearchItemSchema = z.object({
+  symbol: z.string().min(1),
+  exchange: z.string().min(1),
+  quoteType: z.string().min(1),
+  isYahooFinance: z.literal(true),
+  longname: z.string().min(1).optional(),
+  shortname: z.string().min(1).optional(),
+});
+
+export type YahooSearchItemPayload = z.infer<typeof yahooSearchItemSchema>;
